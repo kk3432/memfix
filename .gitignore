@@ -1,0 +1,43 @@
+# 编译产物
+/build/
+/release/
+*.o
+*.a
+*.so
+*.exe
+*.dll
+
+# 发布包（通过GitHub Release提供，不提交到仓库）
+memfix-*.tar.gz
+memfix-*.tar.gz.sha256
+
+# 二进制（aarch64交叉编译产物，通过Release提供）
+# 注意：仓库根目录的memfix二进制不提交，需要时从Release下载
+/memfix
+/memfix-*
+
+# 临时文件
+*.tmp
+*.log
+*.pid
+.cache/
+.tmp-tool-results/
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# Go
+go.sum
+vendor/
+
+# 文档备份
+*.bak
+*.old

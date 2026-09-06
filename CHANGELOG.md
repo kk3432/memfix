@@ -65,5 +65,6 @@
 - 运行时RSS < 200KB
 - 支持aarch64和x86_64架构
 
-[Unreleased]: https://github.com/yourname/memfix/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/yourname/memfix/releases/tag/v1.0.0
+[Unreleased]: https://github.com/kk3432/memfix/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/kk3432/memfix/releases/tag/v1.0.1
+[1.0.0]: https://github.com/kk3432/memfix/releases/tag/v1.0.0
