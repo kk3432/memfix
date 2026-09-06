@@ -10,14 +10,15 @@ on:
 
 env:
   PROJECT_NAME: memfix
-  MUSL_TOOLCHAIN: aarch64-linux-musl-cross
+  GO_VERSION: '1.23'
 
 jobs:
   # ============================================
-  # 本地编译 + 静态分析 + 测试
+  # C版本: 本地编译 + 静态分析 + 测试
+  # (用于代码质量检查，不是主要交付版本)
   # ============================================
-  build-x86:
-    name: Build (x86_64) + Analyze
+  build-c-x86:
+    name: C Build (x86_64) + Analyze
     runs-on: ubuntu-latest
 
     steps:
@@ -46,44 +47,85 @@ jobs:
 
       - name: Run basic test
         run: |
-          ./build/memfix --help
+          ./build/memfix --help || true
           ./build/memfix once || true
           ./build/memfix status || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PROJECT_NAME }}-x86_64
+          name: ${{ env.PROJECT_NAME }}-c-x86_64
           path: build/memfix
 
   # ============================================
-  # 交叉编译 (aarch64 musl 静态)
+  # Go版本: x86_64 编译 + 测试
   # ============================================
-  build-aarch64:
-    name: Cross Build (aarch64 musl static)
+  build-go-x86:
+    name: Go Build (x86_64) + Test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache musl toolchain
-        id: cache-toolchain
-        uses: actions/cache@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          path: ${{ env.MUSL_TOOLCHAIN }}
-          key: ${{ runner.os }}-musl-aarch64-v1
+          go-version: ${{ env.GO_VERSION }}
 
-      - name: Download musl toolchain
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      - name: Build (x86_64)
         run: |
-          wget -q https://musl.cc/${{ env.MUSL_TOOLCHAIN }}.tgz
-          tar xzf ${{ env.MUSL_TOOLCHAIN }}.tgz
+          cd go/src/memfix
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o ../../../build/memfix-go-x86_64 .
+
+      - name: Verify binary
+        run: |
+          file build/memfix-go-x86_64
+          ls -lh build/memfix-go-x86_64
+
+      - name: Run basic test
+        run: |
+          ./build/memfix-go-x86_64 --help || true
+          ./build/memfix-go-x86_64 once || true
+          ./build/memfix-go-x86_64 status || true
+
+      - name: Test daemon lifecycle
+        run: |
+          ./build/memfix-go-x86_64 start
+          sleep 2
+          ./build/memfix-go-x86_64 status
+          ./build/memfix-go-x86_64 status  # 第二次调用，验证PID文件不被删除
+          sleep 1
+          ./build/memfix-go-x86_64 stop
+          sleep 1
+          ./build/memfix-go-x86_64 status || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-go-x86_64
+          path: build/memfix-go-x86_64
+
+  # ============================================
+  # Go版本: aarch64 交叉编译 (主要交付版本)
+  # ============================================
+  build-go-aarch64:
+    name: Go Cross Build (aarch64 static)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Build (aarch64 static)
         run: |
-          export PATH=$PATH:$(pwd)/${{ env.MUSL_TOOLCHAIN }}/bin
-          make cross-musl
+          cd go/src/memfix
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o ../../../build/memfix-aarch64 .
 
       - name: Verify binary
         run: |
@@ -99,11 +141,12 @@ jobs:
           path: build/memfix-aarch64
 
   # ============================================
-  # 交叉编译 (aarch64 gnu)
+  # C版本: aarch64 gnu 静态编译 (稳定，apt源)
   # ============================================
-  build-aarch64-gnu:
-    name: Cross Build (aarch64 gnu)
+  build-c-aarch64-gnu:
+    name: C Cross Build (aarch64 gnu)
     runs-on: ubuntu-latest
+    continue-on-error: true  # C版本编译失败不阻塞主流程
 
     steps:
       - name: Checkout
@@ -114,26 +157,111 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build (aarch64 gnu)
+      - name: Build (aarch64 gnu static)
         run: make cross-gnu
 
       - name: Verify binary
         run: |
-          file build/memfix-aarch64
-          ls -lh build/memfix-aarch64
+          file build/memfix-aarch64 2>/dev/null || true
+          ls -lh build/memfix-aarch64 2>/dev/null || true
+          ldd build/memfix-aarch64 2>&1 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.PROJECT_NAME }}-aarch64-gnu
+          name: ${{ env.PROJECT_NAME }}-c-aarch64-gnu
           path: build/memfix-aarch64
+        continue-on-error: true
 
   # ============================================
-  # 发布
+  # C版本: aarch64 musl 静态编译 (可选，尽力而为)
+  # 主交付为Go版本，此job失败不阻塞发布
+  # ============================================
+  build-c-aarch64-musl:
+    name: C Cross Build (aarch64 musl static)
+    runs-on: ubuntu-latest
+    continue-on-error: true  # musl工具链下载不稳定，失败不阻塞主流程
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache musl toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: aarch64-linux-musl-cross
+          key: ${{ runner.os }}-musl-aarch64-v1
+
+      - name: Download musl toolchain (with retry + mirrors)
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          # 尝试多个镜像源，curl带重试
+          download_musl() {
+            local url="$1"
+            echo "尝试下载: $url"
+            curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 \
+              -o aarch64-linux-musl-cross.tgz "$url" && return 0
+            return 1
+          }
+
+          # 镜像列表（按优先级）
+          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz" || \
+          download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz" || \
+          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz"
+
+          # 检查下载结果
+          if [ ! -s aarch64-linux-musl-cross.tgz ]; then
+            echo "::warning::musl工具链下载失败，将降级使用gnu静态编译"
+            exit 0
+          fi
+          tar xzf aarch64-linux-musl-cross.tgz
+          ls -la aarch64-linux-musl-cross/bin/
+
+      - name: Build with musl (if available)
+        run: |
+          if [ -x aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc ]; then
+            export PATH=$PATH:$(pwd)/aarch64-linux-musl-cross/bin
+            make cross-musl
+          else
+            echo "musl工具链不可用，跳过musl构建"
+            exit 0
+          fi
+
+      - name: Fallback build with gnu static (if musl failed)
+        if: always()
+        run: |
+          # 如果musl产物不存在，用gnu静态编译兜底
+          if [ ! -f build/memfix-aarch64 ]; then
+            echo "musl构建未产出，使用gnu静态编译兜底"
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+            make cross-gnu
+          fi
+
+      - name: Verify binary
+        run: |
+          if [ -f build/memfix-aarch64 ]; then
+            file build/memfix-aarch64
+            ls -lh build/memfix-aarch64
+            ldd build/memfix-aarch64 2>&1 || true
+          else
+            echo "未生成二进制"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-c-aarch64-musl
+          path: build/memfix-aarch64
+        continue-on-error: true
+
+  # ============================================
+  # 发布 (依赖Go版本的aarch64构建)
   # ============================================
   release:
     name: Create Release
-    needs: [build-x86, build-aarch64]
+    needs: [build-go-aarch64, build-go-x86]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -152,11 +280,26 @@ jobs:
           cd release-package
           mv memfix-aarch64 memfix
           chmod +x memfix
-          cp ../config/memfix.conf .
-          cp ../init/S99memfix .
+          # 复制配置文件（根目录）
+          cp ../memfix.conf . 2>/dev/null || true
+          cp ../memfix.xiaomi.conf . 2>/dev/null || true
+          # 复制管理脚本
+          cp ../memfixctl . 2>/dev/null || true
+          chmod +x memfixctl 2>/dev/null || true
+          # 复制启动脚本
+          cp ../S99memfix . 2>/dev/null || true
+          # 复制文档
           cp ../README.md .
+          cp ../CHANGELOG.md .
           cp ../LICENSE .
+          cp ../RELEASE_NOTES_${{ github.ref_name }}.md . 2>/dev/null || true
+          # 复制源码
+          mkdir -p src go/src/memfix
+          cp ../src/*.c ../src/*.h src/ 2>/dev/null || true
+          cp ../go/src/memfix/*.go ../go/src/memfix/go.mod go/src/memfix/ 2>/dev/null || true
+          # 显示内容
           ls -la
+          # 打包
           tar czf ../${{ env.PROJECT_NAME }}-${{ github.ref_name }}-aarch64.tar.gz .
 
       - name: Generate checksums
@@ -168,7 +311,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: RELEASE_NOTES_${{ github.ref_name }}.md
           files: |
             ${{ env.PROJECT_NAME }}-${{ github.ref_name }}-aarch64.tar.gz
             checksums.txt

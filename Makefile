@@ -5,7 +5,7 @@
 
 # 项目信息
 PROJECT    := memfix
-VERSION    := 1.0.0
+VERSION    := 1.0.1
 AUTHOR     := memfix contributors
 LICENSE    := MIT
 
