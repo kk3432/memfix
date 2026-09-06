@@ -1,0 +1,178 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  PROJECT_NAME: memfix
+  MUSL_TOOLCHAIN: aarch64-linux-musl-cross
+
+jobs:
+  # ============================================
+  # 本地编译 + 静态分析 + 测试
+  # ============================================
+  build-x86:
+    name: Build (x86_64) + Analyze
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cppcheck clang-format
+
+      - name: Format check
+        run: |
+          find src -name '*.c' -o -name '*.h' | xargs clang-format --dry-run --Werror
+        continue-on-error: true
+
+      - name: Static analysis
+        run: cppcheck --enable=all --inconclusive --error-exitcode=1 src/
+        continue-on-error: true
+
+      - name: Build (release)
+        run: make
+
+      - name: Build (debug)
+        run: make debug
+
+      - name: Run basic test
+        run: |
+          ./build/memfix --help
+          ./build/memfix once || true
+          ./build/memfix status || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-x86_64
+          path: build/memfix
+
+  # ============================================
+  # 交叉编译 (aarch64 musl 静态)
+  # ============================================
+  build-aarch64:
+    name: Cross Build (aarch64 musl static)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache musl toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MUSL_TOOLCHAIN }}
+          key: ${{ runner.os }}-musl-aarch64-v1
+
+      - name: Download musl toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://musl.cc/${{ env.MUSL_TOOLCHAIN }}.tgz
+          tar xzf ${{ env.MUSL_TOOLCHAIN }}.tgz
+
+      - name: Build (aarch64 static)
+        run: |
+          export PATH=$PATH:$(pwd)/${{ env.MUSL_TOOLCHAIN }}/bin
+          make cross-musl
+
+      - name: Verify binary
+        run: |
+          file build/memfix-aarch64
+          ls -lh build/memfix-aarch64
+          # 检查是否静态链接
+          ldd build/memfix-aarch64 2>&1 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-aarch64
+          path: build/memfix-aarch64
+
+  # ============================================
+  # 交叉编译 (aarch64 gnu)
+  # ============================================
+  build-aarch64-gnu:
+    name: Cross Build (aarch64 gnu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build (aarch64 gnu)
+        run: make cross-gnu
+
+      - name: Verify binary
+        run: |
+          file build/memfix-aarch64
+          ls -lh build/memfix-aarch64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-aarch64-gnu
+          path: build/memfix-aarch64
+
+  # ============================================
+  # 发布
+  # ============================================
+  release:
+    name: Create Release
+    needs: [build-x86, build-aarch64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download aarch64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-aarch64
+          path: release-package/
+
+      - name: Prepare release package
+        run: |
+          cd release-package
+          mv memfix-aarch64 memfix
+          chmod +x memfix
+          cp ../config/memfix.conf .
+          cp ../init/S99memfix .
+          cp ../README.md .
+          cp ../LICENSE .
+          ls -la
+          tar czf ../${{ env.PROJECT_NAME }}-${{ github.ref_name }}-aarch64.tar.gz .
+
+      - name: Generate checksums
+        run: |
+          sha256sum ${{ env.PROJECT_NAME }}-${{ github.ref_name }}-aarch64.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          files: |
+            ${{ env.PROJECT_NAME }}-${{ github.ref_name }}-aarch64.tar.gz
+            checksums.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

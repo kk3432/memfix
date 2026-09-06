@@ -1,0 +1,130 @@
+#!/bin/sh
+# memfixctl - memfix 管理脚本（小米路由器专用，兼容BusyBox sh）
+# 路径: /userdisk/.memfix/memfixctl
+# 作用: 封装memfix的start/stop/status/restart，直接用ps管理进程
+# 注意: BusyBox sh不支持在函数外用local，所以case分支里不用local
+
+MEMFIX_DIR="/userdisk/.memfix"
+MEMFIX_BIN="$MEMFIX_DIR/memfix"
+CONF_SRC="$MEMFIX_DIR/memfix.conf"
+CONF_DST="/etc/memfix.conf"
+PID_FILE="/var/run/memfix.pid"
+LOG_FILE="/var/log/memfix.log"
+
+# 获取memfix进程PID
+get_pid() {
+    ps w | grep -v grep | grep "$MEMFIX_BIN" | head -1 | awk '{print $1}'
+}
+
+# 检查进程是否在运行
+is_running() {
+    pid=$(get_pid)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# 写入PID文件
+write_pid() {
+    pid=$(get_pid)
+    if [ -n "$pid" ]; then
+        echo "$pid" > "$PID_FILE" 2>/dev/null
+    fi
+}
+
+# 复制配置文件
+copy_config() {
+    if [ -f "$CONF_SRC" ]; then
+        cp "$CONF_SRC" "$CONF_DST" 2>/dev/null
+    fi
+}
+
+case "$1" in
+    start)
+        if is_running; then
+            echo "memfix 已在运行，PID=$(get_pid)"
+            write_pid
+            exit 0
+        fi
+        copy_config
+        echo "正在启动 memfix..."
+        "$MEMFIX_BIN" start
+        sleep 2
+        if is_running; then
+            write_pid
+            echo "memfix 启动成功，PID=$(get_pid)"
+        else
+            echo "memfix 启动失败"
+            exit 1
+        fi
+        ;;
+
+    stop)
+        if ! is_running; then
+            echo "memfix 未运行"
+            rm -f "$PID_FILE"
+            exit 0
+        fi
+        pid=$(get_pid)
+        echo "正在停止 memfix (PID=$pid)..."
+        # 先尝试用memfix自己的stop（如果PID文件存在）
+        if [ -f "$PID_FILE" ]; then
+            "$MEMFIX_BIN" stop 2>/dev/null
+        fi
+        sleep 2
+        if is_running; then
+            echo "进程未响应，强制杀死..."
+            kill -9 "$(get_pid)" 2>/dev/null
+            sleep 1
+        fi
+        rm -f "$PID_FILE"
+        echo "memfix 已停止"
+        ;;
+
+    restart)
+        echo "正在重启 memfix..."
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+
+    status)
+        if is_running; then
+            pid=$(get_pid)
+            write_pid
+            echo "memfix 正在运行，PID=$pid"
+            echo ""
+            echo "=== 内存状态 ==="
+            cat /proc/meminfo | head -5
+            echo ""
+            echo "=== 最近日志 ==="
+            if [ -f "$LOG_FILE" ]; then
+                tail -10 "$LOG_FILE"
+            else
+                echo "(日志文件不存在: $LOG_FILE)"
+            fi
+        else
+            echo "memfix 未运行"
+            rm -f "$PID_FILE"
+            exit 1
+        fi
+        ;;
+
+    once)
+        copy_config
+        "$MEMFIX_BIN" once
+        write_pid
+        ;;
+
+    *)
+        echo "用法: $0 {start|stop|restart|status|once}"
+        echo ""
+        echo "  start    启动memfix守护进程"
+        echo "  stop     停止memfix"
+        echo "  restart  重启memfix"
+        echo "  status   查看运行状态、内存和日志"
+        echo "  once     执行单次内存检查和回收"
+        exit 1
+        ;;
+esac
