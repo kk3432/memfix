@@ -175,12 +175,11 @@ jobs:
 
   # ============================================
   # C版本: aarch64 musl 静态编译 (可选，尽力而为)
-  # 主交付为Go版本，此job失败不阻塞发布
+  # musl.cc下载不稳定，下载失败则跳过（gnu版本由独立job提供）
   # ============================================
   build-c-aarch64-musl:
     name: C Cross Build (aarch64 musl static)
     runs-on: ubuntu-latest
-    continue-on-error: true  # musl工具链下载不稳定，失败不阻塞主流程
 
     steps:
       - name: Checkout
@@ -195,51 +194,36 @@ jobs:
 
       - name: Download musl toolchain (with retry + mirrors)
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        continue-on-error: true
-        timeout-minutes: 5
         run: |
-          # 尝试多个镜像源，curl带重试
+          # 尝试多个镜像源，curl带重试；全部失败则跳过（不报错）
           download_musl() {
             local url="$1"
             echo "尝试下载: $url"
-            curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 120 \
+            curl -fL --retry 2 --retry-delay 3 --connect-timeout 15 --max-time 90 \
               -o aarch64-linux-musl-cross.tgz "$url" && return 0
             return 1
           }
 
           # 镜像列表（按优先级）
           download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz" || \
-          download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz" || \
-          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz"
+          download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz"
 
-          # 检查下载结果
+          # 检查下载结果，失败则跳过（不导致job失败）
           if [ ! -s aarch64-linux-musl-cross.tgz ]; then
-            echo "::warning::musl工具链下载失败，将降级使用gnu静态编译"
+            echo "::notice::musl工具链下载失败，跳过musl构建（gnu版本由独立job提供）"
             exit 0
           fi
           tar xzf aarch64-linux-musl-cross.tgz
           ls -la aarch64-linux-musl-cross/bin/
 
       - name: Build with musl (if available)
-        continue-on-error: true
         run: |
           if [ -x aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc ]; then
             export PATH=$PATH:$(pwd)/aarch64-linux-musl-cross/bin
             make cross-musl
           else
-            echo "musl工具链不可用，跳过musl构建，将使用gnu兜底"
+            echo "musl工具链不可用，跳过musl构建"
             exit 0
-          fi
-
-      - name: Fallback build with gnu static (if musl failed)
-        if: always()
-        run: |
-          # 如果musl产物不存在，用gnu静态编译兜底
-          if [ ! -f build/memfix-aarch64 ]; then
-            echo "musl构建未产出，使用gnu静态编译兜底"
-            sudo apt-get update
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-            make cross-gnu
           fi
 
       - name: Verify binary
@@ -249,7 +233,7 @@ jobs:
             ls -lh build/memfix-aarch64
             ldd build/memfix-aarch64 2>&1 || true
           else
-            echo "未生成二进制"
+            echo "未生成musl二进制（已跳过，gnu版本见独立job）"
           fi
 
       - name: Upload artifact
