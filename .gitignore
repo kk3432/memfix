@@ -41,3 +41,6 @@ vendor/
 # 文档备份
 *.bak
 *.old
+
+# 临时截图
+screenshot*.png
