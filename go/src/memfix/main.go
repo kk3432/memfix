@@ -18,7 +18,7 @@ import (
 
 // 版本信息
 const (
-	Version     = "1.0.1"
+	Version     = "1.1.0"
 	ProjectName = "memfix"
 	Description = "小米AX3000T(联发科版) 内存泄漏监控修复工具"
 )
@@ -27,11 +27,18 @@ const (
 const (
 	DefaultCheckInterval = 30   // 默认检查间隔(秒)
 	DefaultMemThreshold  = 15   // 默认可用内存阈值(百分比)
-	DefaultLogFile       = "/var/log/memfix.log"
+	DefaultLogFile       = "/tmp/memfix.log"
 	DefaultPidFile       = "/var/run/memfix.pid"
 	DefaultConfigFile    = "/etc/memfix.conf"
 	FallbackLogFile      = "/tmp/memfix.log"
 	FallbackPidFile      = "/tmp/memfix.pid"
+
+	// 场景调控: 触发回收后的密集监控参数
+	BoostDuration = 300 // 密集监控持续时间(秒) = 5分钟
+	BoostInterval = 2   // 密集监控间隔(秒)
+
+	// 日志轮换
+	LogRotateDays = 3 // 日志每N天轮换一次
 )
 
 // Config 配置结构体
@@ -42,6 +49,7 @@ type Config struct {
 	EnableDropCaches  bool   // 是否启用drop_caches
 	EnableSlabCompact bool   // 是否启用slab压缩
 	Verbose           bool   // 详细日志
+	LogFile           string // 日志文件路径（由配置文件指定）
 }
 
 // MemInfo 内存信息结构体
@@ -55,18 +63,21 @@ type MemInfo struct {
 }
 
 var (
-	config   Config
-	logFile  *os.File
-	pidFile  string
-	running  = true
+	config       Config
+	logFile      *os.File
+	pidFile      string
+	running      = true
+	boostMode    bool      // 是否处于密集监控模式
+	boostEndTime time.Time // 密集监控结束时间
+	cstLocation  = time.FixedZone("CST", 8*3600) // 固定UTC+8时区，修复路由器时区错误导致的时间戳偏移
 )
 
-// logMsg 记录日志
+// logMsg 记录日志（使用固定CST时区，避免路由器系统时区为UTC导致时间戳偏移8小时）
 func logMsg(level, format string, args ...interface{}) {
 	if logFile == nil {
 		return
 	}
-	now := time.Now().Format("2006-01-02 15:04:05")
+	now := time.Now().In(cstLocation).Format("2006-01-02 15:04:05")
 	msg := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("[%s] [%s] %s\n", now, level, msg)
 	logFile.WriteString(line)
@@ -75,7 +86,6 @@ func logMsg(level, format string, args ...interface{}) {
 
 // getPidFilePath 获取可用的PID文件路径（无副作用，不删除已存在的文件）
 func getPidFilePath() string {
-	// 优先检查默认路径的父目录是否可写（用临时文件测试，不触碰真实PID文件）
 	testFile := filepath.Join(filepath.Dir(DefaultPidFile), ".memfix_write_test")
 	f, err := os.OpenFile(testFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err == nil {
@@ -97,14 +107,122 @@ func findExistingPidFile() string {
 	return ""
 }
 
-// getLogFilePath 获取可用的日志文件路径
+// getLogFilePath 获取可用的日志文件路径（优先使用配置文件指定的路径）
 func getLogFilePath() string {
-	f, err := os.OpenFile(DefaultLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err == nil {
-		f.Close()
-		return DefaultLogFile
+	// 优先使用配置文件指定的路径
+	candidates := []string{config.LogFile, DefaultLogFile, FallbackLogFile}
+	for _, path := range candidates {
+		if path == "" {
+			continue
+		}
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			f.Close()
+			return path
+		}
 	}
 	return FallbackLogFile
+}
+
+// rotateLogIfNeeded 检查日志文件是否需要轮换（在打开文件之前调用，避免O_APPEND更新mtime）
+func rotateLogIfNeeded(logPath string) {
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return
+	}
+	// 如果日志文件修改时间超过N天，执行轮换
+	if time.Since(info.ModTime()) >= time.Duration(LogRotateDays)*24*time.Hour {
+		// 移除旧的.1备份（如果存在）
+		os.Remove(logPath + ".1")
+		// 重命名当前日志为.1
+		os.Rename(logPath, logPath+".1")
+	}
+}
+
+// checkLogRotate 运行时检查并执行日志轮换（每LogRotateDays天轮换一次）
+func checkLogRotate() {
+	if logFile == nil {
+		return
+	}
+	logPath := getLogFilePath()
+	info, err := os.Stat(logPath)
+	if err != nil {
+		return
+	}
+	// 如果日志文件修改时间超过N天，执行轮换
+	if time.Since(info.ModTime()) >= time.Duration(LogRotateDays)*24*time.Hour {
+		logMsg("INFO", "日志文件超过%d天，执行轮换", LogRotateDays)
+		logFile.Close()
+		rotateLogIfNeeded(logPath)
+		// 创建新日志文件
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			logFile = f
+			logMsg("INFO", "日志轮换完成，旧日志保存为 %s.1", logPath)
+		} else {
+			// 尝试fallback路径
+			f2, err2 := os.OpenFile(FallbackLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err2 == nil {
+				logFile = f2
+				logMsg("WARN", "原日志路径不可写，切换到 %s", FallbackLogFile)
+			}
+		}
+	}
+}
+
+// analyzeLogStats 分析近三天日志统计：回收次数、平均可用内存百分比
+func analyzeLogStats() (recoverCount int, avgAvailPercent float64, sampleCount int) {
+	logPath := getLogFilePath()
+	threeDaysAgo := time.Now().In(cstLocation).Add(-time.Duration(LogRotateDays) * 24 * time.Hour)
+
+	// 同时读取当前日志和轮换后的.1日志
+	files := []string{logPath, logPath + ".1"}
+	var totalAvail int
+
+	for _, fpath := range files {
+		data, err := os.ReadFile(fpath)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if len(line) < 21 || line[0] != '[' {
+				continue
+			}
+			// 解析时间戳 [2006-01-02 15:04:05]
+			ts, err := time.ParseInLocation("2006-01-02 15:04:05", line[1:20], cstLocation)
+			if err != nil {
+				continue
+			}
+			if ts.Before(threeDaysAgo) {
+				continue
+			}
+			// 统计回收次数（匹配"内存回收完成"）
+			if strings.Contains(line, "内存回收完成") {
+				recoverCount++
+			}
+			// 统计平均可用内存百分比（从DEBUG行"内存状态"中提取）
+			if strings.Contains(line, "内存状态:") {
+				// 格式: 可用=XXMB(YY%%)
+				idx := strings.Index(line, "(")
+				if idx > 0 {
+					rest := line[idx+1:]
+					end := strings.Index(rest, "%%)")
+					if end > 0 {
+						if pct, err := strconv.Atoi(rest[:end]); err == nil {
+							totalAvail += pct
+							sampleCount++
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if sampleCount > 0 {
+		avgAvailPercent = float64(totalAvail) / float64(sampleCount)
+	}
+	return
 }
 
 // initDefaultConfig 初始化默认配置
@@ -116,6 +234,7 @@ func initDefaultConfig() {
 		EnableDropCaches:  true,
 		EnableSlabCompact: true,
 		Verbose:           true,
+		LogFile:           DefaultLogFile,
 	}
 }
 
@@ -131,11 +250,9 @@ func loadConfig(path string) {
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// 跳过注释和空行
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// 解析 key=value
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -160,10 +277,14 @@ func loadConfig(path string) {
 			config.EnableSlabCompact = value == "1" || strings.ToLower(value) == "true"
 		case "verbose":
 			config.Verbose = value == "1" || strings.ToLower(value) == "true"
+		case "log_file":
+			if value != "" {
+				config.LogFile = value
+			}
 		}
 	}
 
-	logMsg("INFO", "配置已加载: 间隔=%ds 阈值=%d%% 重启进程=%s drop_caches=%v slab_compact=%v verbose=%v",
+	logMsg("INFO", "配置已加载: 间隔=%ds 阈值=%d%% 重启进程=%s drop_caches=%v slab_compact=%v verbose=%v 日志=%s",
 		config.CheckInterval, config.MemThreshold,
 		func() string {
 			if config.RestartProc == "" {
@@ -171,7 +292,7 @@ func loadConfig(path string) {
 			}
 			return config.RestartProc
 		}(),
-		config.EnableDropCaches, config.EnableSlabCompact, config.Verbose)
+		config.EnableDropCaches, config.EnableSlabCompact, config.Verbose, config.LogFile)
 }
 
 // readMemInfo 读取内存信息
@@ -192,7 +313,6 @@ func readMemInfo() (*MemInfo, error) {
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
-		// 提取数字（去掉kB）
 		valueStr := strings.TrimSpace(parts[1])
 		valueStr = strings.Fields(valueStr)[0]
 		value, err := strconv.ParseInt(valueStr, 10, 64)
@@ -240,10 +360,8 @@ func writeSysctl(path, value string) error {
 // doDropCaches 释放页缓存
 func doDropCaches() error {
 	logMsg("INFO", "执行 drop_caches (释放页缓存+目录项+inode)")
-	// 先同步
 	syscall.Sync()
 	time.Sleep(100 * time.Millisecond)
-	// 3 = 释放页缓存 + 目录项 + inode
 	return writeSysctl("/proc/sys/vm/drop_caches", "3")
 }
 
@@ -267,7 +385,6 @@ func findProcessPid(procName string) int {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		// 读取进程名
 		commPath := filepath.Join("/proc", entry.Name(), "comm")
 		comm, err := os.ReadFile(commPath)
 		if err != nil {
@@ -295,7 +412,6 @@ func restartProcess(procName string) error {
 
 	logMsg("INFO", "重启进程 %s (PID=%d)", procName, pid)
 
-	// 发送SIGTERM
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return err
@@ -305,7 +421,6 @@ func restartProcess(procName string) error {
 		return err
 	}
 
-	// 等待进程退出，最多5秒
 	for i := 0; i < 50; i++ {
 		time.Sleep(100 * time.Millisecond)
 		if process.Signal(syscall.Signal(0)) != nil {
@@ -314,13 +429,11 @@ func restartProcess(procName string) error {
 		}
 	}
 
-	// 如果还在，强制杀死
 	if process.Signal(syscall.Signal(0)) == nil {
 		logMsg("WARN", "进程 %s 未响应SIGTERM，发送SIGKILL", procName)
 		process.Kill()
 	}
 
-	// 等待init/procd重启进程
 	time.Sleep(2 * time.Second)
 
 	newPid := findProcessPid(procName)
@@ -332,8 +445,50 @@ func restartProcess(procName string) error {
 	return fmt.Errorf("进程未自动重启")
 }
 
+// doRecoveryActions 执行实际的内存回收操作（drop_caches + slab_compact + 可选重启进程）
+func doRecoveryActions() int {
+	recovered := 0
+
+	// 步骤1: 释放页缓存
+	if config.EnableDropCaches {
+		if doDropCaches() == nil {
+			recovered++
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 步骤2: 压缩slab
+	if config.EnableSlabCompact {
+		if doSlabCompact() == nil {
+			recovered++
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// 步骤3: 重启泄漏进程（如果配置了，且回收后内存仍不足）
+	if config.RestartProc != "" {
+		after, err := readMemInfo()
+		if err == nil {
+			afterPercent := int(after.AvailableKB * 100 / after.TotalKB)
+			if afterPercent <= config.MemThreshold {
+				logMsg("INFO", "缓存回收后可用内存仍为%d%%，尝试重启进程 %s",
+					afterPercent, config.RestartProc)
+				if restartProcess(config.RestartProc) == nil {
+					recovered++
+				}
+			} else {
+				logMsg("INFO", "缓存回收后可用内存恢复到%d%%，无需重启进程", afterPercent)
+			}
+		}
+	}
+
+	return recovered
+}
+
 // checkAndRecover 内存检查与修复主逻辑
-func checkAndRecover() int {
+// force=true 时不论内存是否充足都强制回收（用于once命令）
+// force=false 时仅在可用内存低于阈值时回收（用于守护进程）
+func checkAndRecover(force bool) int {
 	info, err := readMemInfo()
 	if err != nil {
 		return -1
@@ -348,70 +503,38 @@ func checkAndRecover() int {
 			info.FreeKB/1024, info.CachedKB/1024, info.SlabKB/1024)
 	}
 
-	if availPercent <= config.MemThreshold {
+	// 非强制模式下，内存充足则不回收
+	if !force && availPercent > config.MemThreshold {
+		return 0
+	}
+
+	if force {
+		logMsg("INFO", "强制内存回收: 当前可用=%d%% (阈值=%d%%)", availPercent, config.MemThreshold)
+	} else {
 		logMsg("WARN",
 			"可用内存过低: %d%% (阈值=%d%%)，开始内存回收",
 			availPercent, config.MemThreshold)
-
-		recovered := 0
-
-		// 步骤1: 释放页缓存
-		if config.EnableDropCaches {
-			if doDropCaches() == nil {
-				recovered++
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		// 步骤2: 压缩slab
-		if config.EnableSlabCompact {
-			if doSlabCompact() == nil {
-				recovered++
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-
-		// 步骤3: 重启泄漏进程（如果配置了）
-		if config.RestartProc != "" {
-			// 先检查回收后内存是否仍然不足
-			after, err := readMemInfo()
-			if err == nil {
-				afterPercent := int(after.AvailableKB * 100 / after.TotalKB)
-				if afterPercent <= config.MemThreshold {
-					logMsg("INFO", "缓存回收后可用内存仍为%d%%，尝试重启进程 %s",
-						afterPercent, config.RestartProc)
-					if restartProcess(config.RestartProc) == nil {
-						recovered++
-					}
-				} else {
-					logMsg("INFO", "缓存回收后可用内存恢复到%d%%，无需重启进程", afterPercent)
-				}
-			}
-		}
-
-		// 记录回收后状态
-		final, err := readMemInfo()
-		if err == nil {
-			finalPercent := int(final.AvailableKB * 100 / final.TotalKB)
-			freedKB := final.AvailableKB - info.AvailableKB
-			logMsg("INFO", "内存回收完成: 可用内存 %d%% -> %d%%，释放约 %dMB",
-				availPercent, finalPercent, freedKB/1024)
-		}
-
-		return recovered
 	}
 
-	return 0
+	recovered := doRecoveryActions()
+
+	// 记录回收后状态
+	final, err := readMemInfo()
+	if err == nil {
+		finalPercent := int(final.AvailableKB * 100 / final.TotalKB)
+		freedKB := final.AvailableKB - info.AvailableKB
+		logMsg("INFO", "内存回收完成: 可用内存 %d%% -> %d%%，释放约 %dMB",
+			availPercent, finalPercent, freedKB/1024)
+	}
+
+	return recovered
 }
 
-// daemonize 守护进程化（使用环境变量标记避免循环）
+// daemonize 守护进程化
 func daemonize() error {
-	// 检查是否是子进程（由父进程重新启动）
 	if os.Getenv("MEMFIX_DAEMON_CHILD") == "1" {
-		// 子进程：创建新会话，然后第二次fork
 		syscall.Setsid()
 
-		// 第二次fork（孙进程）
 		if os.Getenv("MEMFIX_DAEMON_GRANDCHILD") != "1" {
 			cmd := exec.Command(os.Args[0], os.Args[1:]...)
 			cmd.Env = append(os.Environ(), "MEMFIX_DAEMON_GRANDCHILD=1")
@@ -421,28 +544,24 @@ func daemonize() error {
 			if err := cmd.Start(); err != nil {
 				return err
 			}
-			// 子进程退出，让孙进程继续
 			os.Exit(0)
 		}
 
-		// 孙进程：继续执行
 		os.Chdir("/")
 		syscall.Umask(0)
 
-		// 关闭标准文件描述符
 		os.Stdin.Close()
 		os.Stdout.Close()
 		os.Stderr.Close()
 
-		// 打开日志
 		logPath := getLogFilePath()
+		rotateLogIfNeeded(logPath) // 打开前先检查轮换，避免O_APPEND更新mtime
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
 			return err
 		}
 		logFile = f
 
-		// 写入PID文件
 		pidFile = getPidFilePath()
 		pidContent := fmt.Sprintf("%d\n", os.Getpid())
 		os.WriteFile(pidFile, []byte(pidContent), 0644)
@@ -450,7 +569,6 @@ func daemonize() error {
 		return nil
 	}
 
-	// 父进程：启动子进程并退出
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "MEMFIX_DAEMON_CHILD=1")
 	cmd.Stdin = nil
@@ -464,28 +582,59 @@ func daemonize() error {
 	return nil
 }
 
+// sleepWithInterrupt 可被信号中断的分段sleep
+func sleepWithInterrupt(seconds int) {
+	for i := 0; i < seconds && running; i++ {
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// runMainLoop 主循环（支持密集监控模式和日志轮换）
+func runMainLoop() {
+	for running {
+		// 检查日志轮换
+		checkLogRotate()
+
+		recovered := checkAndRecover(false)
+
+		// 场景调控: 触发回收后进入密集监控模式
+		if recovered > 0 {
+			boostMode = true
+			boostEndTime = time.Now().Add(time.Duration(BoostDuration) * time.Second)
+			logMsg("INFO", "进入密集监控模式: 未来%d分钟内每%d秒检测一次",
+				BoostDuration/60, BoostInterval)
+		}
+
+		// 决定本次sleep间隔
+		interval := config.CheckInterval
+		if boostMode {
+			if time.Now().After(boostEndTime) {
+				boostMode = false
+				logMsg("INFO", "密集监控模式结束，恢复正常间隔%d秒", config.CheckInterval)
+			} else {
+				interval = BoostInterval
+			}
+		}
+
+		sleepWithInterrupt(interval)
+	}
+}
+
 // runForeground 前台运行模式
 func runForeground() {
 	logFile = os.Stdout
 	fmt.Println("memfix 前台调试模式启动")
 	fmt.Printf("配置: 间隔=%ds 阈值=%d%%\n", config.CheckInterval, config.MemThreshold)
-
-	for running {
-		checkAndRecover()
-		// 分段sleep
-		for i := 0; i < config.CheckInterval && running; i++ {
-			time.Sleep(1 * time.Second)
-		}
-	}
+	runMainLoop()
 }
 
-// runOnce 单次执行模式
+// runOnce 单次执行模式（强制回收，不论内存是否充足）
 func runOnce() int {
 	logFile = os.Stdout
-	fmt.Println("memfix 单次检查模式")
-	result := checkAndRecover()
+	fmt.Println("memfix 单次强制回收模式")
+	result := checkAndRecover(true)
 	if result == 0 {
-		fmt.Println("内存正常，无需回收")
+		fmt.Println("未执行回收操作（请检查配置）")
 	} else if result > 0 {
 		fmt.Printf("已执行 %d 项内存回收操作\n", result)
 	}
@@ -494,7 +643,6 @@ func runOnce() int {
 
 // showStatus 显示状态
 func showStatus() int {
-	// 查找已存在的PID文件（无副作用）
 	pidPath := findExistingPidFile()
 	if pidPath == "" {
 		fmt.Println("memfix 未运行（无PID文件）")
@@ -513,7 +661,6 @@ func showStatus() int {
 		return 1
 	}
 
-	// 检查进程是否存在
 	process, err := os.FindProcess(pid)
 	if err != nil || process.Signal(syscall.Signal(0)) != nil {
 		fmt.Printf("memfix 未运行（PID文件存在但进程不存在，PID=%d）\n", pid)
@@ -529,6 +676,25 @@ func showStatus() int {
 		fmt.Printf("当前内存: 总计=%dMB 可用=%dMB(%d%%) 空闲=%dMB 缓存=%dMB Slab=%dMB\n",
 			info.TotalKB/1024, info.AvailableKB/1024, availPercent,
 			info.FreeKB/1024, info.CachedKB/1024, info.SlabKB/1024)
+	}
+
+	// 显示近三天统计
+	recoverCount, avgAvail, sampleCount := analyzeLogStats()
+	fmt.Println("\n近三天统计:")
+	fmt.Printf("  回收次数: %d 次\n", recoverCount)
+	if sampleCount > 0 {
+		fmt.Printf("  平均可用内存: %.1f%% (基于 %d 次采样)\n", avgAvail, sampleCount)
+	} else {
+		fmt.Println("  平均可用内存: 无数据")
+	}
+
+	// 显示密集监控状态
+	if boostMode {
+		remaining := int(time.Until(boostEndTime).Seconds())
+		if remaining > 0 {
+			fmt.Printf("  密集监控模式: 开启 (剩余 %d 秒，每 %d 秒检测一次)\n",
+				remaining, BoostInterval)
+		}
 	}
 
 	// 显示最近日志
@@ -553,7 +719,6 @@ func showStatus() int {
 
 // stopDaemon 停止守护进程
 func stopDaemon() int {
-	// 查找已存在的PID文件（无副作用）
 	pidPath := findExistingPidFile()
 	if pidPath == "" {
 		fmt.Println("memfix 未运行")
@@ -586,7 +751,6 @@ func stopDaemon() int {
 	}
 
 	fmt.Println("已发送停止信号，等待进程退出...")
-	// 等待最多5秒（给信号处理足够时间）
 	for i := 0; i < 50; i++ {
 		time.Sleep(100 * time.Millisecond)
 		if process.Signal(syscall.Signal(0)) != nil {
@@ -610,14 +774,15 @@ func usage() {
 	fmt.Println("  start        以守护进程方式启动（默认）")
 	fmt.Println("  stop         停止正在运行的守护进程")
 	fmt.Println("  restart      重启守护进程")
-	fmt.Println("  status       显示运行状态和当前内存信息")
-	fmt.Println("  once         执行单次内存检查和回收（前台）")
+	fmt.Println("  status       显示运行状态、近三天统计和当前内存信息")
+	fmt.Println("  once         执行单次强制内存回收（不论内存是否充足）")
 	fmt.Println("  foreground   前台运行（调试用，输出到stdout）")
 	fmt.Println("  -h, --help   显示此帮助信息")
 	fmt.Println()
-	fmt.Printf("配置文件: %s\n", DefaultConfigFile)
-	fmt.Printf("日志文件: %s (或 %s)\n", DefaultLogFile, FallbackLogFile)
+	fmt.Printf("配置文件: %s (可指定 log_file 自定义日志路径)\n", DefaultConfigFile)
+	fmt.Printf("默认日志: %s，每%d天自动轮换\n", DefaultLogFile, LogRotateDays)
 	fmt.Printf("PID 文件: %s (或 %s)\n", DefaultPidFile, FallbackPidFile)
+	fmt.Printf("场景调控: 触发回收后%d分钟内每%d秒密集检测\n", BoostDuration/60, BoostInterval)
 }
 
 // signalHandler 信号处理
@@ -648,10 +813,11 @@ func main() {
 		action = os.Args[1]
 	}
 
-	// 初始化默认配置
 	initDefaultConfig()
 
-	// 处理不需要配置的命令
+	// 所有命令都先加载配置（status需要读取配置中指定的日志路径）
+	loadConfig(DefaultConfigFile)
+
 	if action == "stop" {
 		os.Exit(stopDaemon())
 	}
@@ -659,15 +825,10 @@ func main() {
 		os.Exit(showStatus())
 	}
 
-	// 加载配置
-	loadConfig(DefaultConfigFile)
-
-	// 注册信号处理
 	go signalHandler()
 
 	switch action {
 	case "start":
-		// 检查是否已在运行（使用无副作用的查找）
 		pidPath := findExistingPidFile()
 		if pidPath != "" {
 			if pidData, err := os.ReadFile(pidPath); err == nil {
@@ -678,7 +839,6 @@ func main() {
 					}
 				}
 			}
-			// PID文件存在但进程不在，清理旧PID文件
 			os.Remove(pidPath)
 		}
 
@@ -689,13 +849,10 @@ func main() {
 
 		logMsg("INFO", "===== memfix 守护进程启动 =====")
 		logMsg("INFO", "版本: %s | 目标: 小米AX3000T(MT7981B) | Go版本: %s", Version, runtime.Version())
+		logMsg("INFO", "场景调控: 触发回收后%d分钟内每%d秒密集检测 | 日志每%d天轮换",
+			BoostDuration/60, BoostInterval, LogRotateDays)
 
-		for running {
-			checkAndRecover()
-			for i := 0; i < config.CheckInterval && running; i++ {
-				time.Sleep(1 * time.Second)
-			}
-		}
+		runMainLoop()
 
 		logMsg("INFO", "===== memfix 守护进程停止 =====")
 		if logFile != nil {
@@ -713,7 +870,6 @@ func main() {
 		fmt.Println("正在重启 memfix...")
 		stopDaemon()
 		time.Sleep(2 * time.Second)
-		// 重新执行start，等待daemonize父进程退出
 		cmd := exec.Command(os.Args[0], "start")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
