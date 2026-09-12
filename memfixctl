@@ -9,7 +9,11 @@ MEMFIX_BIN="$MEMFIX_DIR/memfix"
 CONF_SRC="$MEMFIX_DIR/memfix.conf"
 CONF_DST="/etc/memfix.conf"
 PID_FILE="/var/run/memfix.pid"
-LOG_FILE="/var/log/memfix.log"
+# 日志路径优先从配置文件读取，兼容v1.1.0+的log_file配置项
+LOG_FILE=$(grep -E '^\s*log_file\s*=' "$CONF_SRC" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')
+if [ -z "$LOG_FILE" ]; then
+    LOG_FILE="/tmp/memfix.log"
+fi
 
 # 获取memfix进程PID
 get_pid() {
@@ -93,17 +97,9 @@ case "$1" in
         if is_running; then
             pid=$(get_pid)
             write_pid
-            echo "memfix 正在运行，PID=$pid"
-            echo ""
-            echo "=== 内存状态 ==="
-            cat /proc/meminfo | head -5
-            echo ""
-            echo "=== 最近日志 ==="
-            if [ -f "$LOG_FILE" ]; then
-                tail -10 "$LOG_FILE"
-            else
-                echo "(日志文件不存在: $LOG_FILE)"
-            fi
+            # 优先调用memfix自己的status（显示近三天统计、密集监控状态等完整信息）
+            copy_config
+            "$MEMFIX_BIN" status
         else
             echo "memfix 未运行"
             rm -f "$PID_FILE"
