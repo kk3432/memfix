@@ -1,62 +1,38 @@
 #!/bin/sh
 # ============================================
-# memfix 小米官方固件专用安装脚本
-# 适配小米AX3000T(联发科版)及其他小米路由器
+# memfix 一键安装脚本（小米AX3000T专用）
+# 通过 gh-proxy.com 加速下载 GitHub 发布包
 #
-# 小米固件特点：
-#   - rootfs为squashfs只读，/etc为overlay可写
-#   - /var为tmpfs内存文件系统，重启后丢失
-#   - 开机自启支持 /etc/rc.local 和 /etc/init.d/
-#   - 使用BusyBox，命令功能可能受限
+# 用法:
+#   wget -qO- https://gh-proxy.com/https://raw.githubusercontent.com/kk3432/memfix/main/install_xiaomi.sh | sh
+#
+# 指定版本:
+#   MEMFIX_VERSION=v1.1.0 wget -qO- https://gh-proxy.com/https://raw.githubusercontent.com/kk3432/memfix/main/install_xiaomi.sh | sh
 # ============================================
 
 set -e
 
 PROG_NAME="memfix"
-VERSION="1.0.0"
+VERSION="${MEMFIX_VERSION:-v1.1.0}"
+GITHUB_REPO="kk3432/memfix"
+GH_PROXY="https://gh-proxy.com"
+INSTALL_DIR="/userdisk/.memfix"
+TMP_DIR="/tmp/memfix_install_$$"
+CONF_DST="/etc/memfix.conf"
+CRON_FILE="/etc/crontabs/root"
 
-# 小米固件可写路径
-INSTALL_BIN="/userdisk/.memfix"   # 用户数据分区，持久化
-INSTALL_ETC="/etc"                 # overlay可写
-INIT_SCRIPT="/etc/init.d/memfix"
-RC_LOCAL="/etc/rc.local"
+# ---------- 输出函数 ----------
+info()  { echo "[INFO]  $1"; }
+warn()  { echo "[WARN]  $1"; }
+error() { echo "[ERROR] $1"; exit 1; }
 
-# 颜色输出（BusyBox sh可能不支持，做兼容）
-info() {
-    echo "[INFO] $1"
-}
-
-warn() {
-    echo "[WARN] $1"
-}
-
-error() {
-    echo "[ERROR] $1"
-    exit 1
-}
-
-# 检查是否为root
+# ---------- 前置检查 ----------
 check_root() {
     if [ "$(id -u)" != "0" ]; then
-        error "此脚本需要root权限运行"
+        error "此脚本需要 root 权限运行"
     fi
 }
 
-# 检测是否为小米固件
-detect_xiaomi() {
-    info "检测固件类型..."
-    if [ -f "/etc/xiaoqiang_version" ] || [ -f "/etc/miwifi_version" ] || \
-       [ -d "/etc/init.d/miwifi" ] || [ -f "/usr/sbin/mcpd" ]; then
-        info "检测到小米官方固件"
-        return 0
-    else
-        warn "未检测到小米固件特征，仍将继续安装"
-        warn "如为标准OpenWrt，建议使用 install.sh"
-        return 1
-    fi
-}
-
-# 检查架构
 check_arch() {
     ARCH=$(uname -m)
     info "系统架构: $ARCH"
@@ -64,188 +40,277 @@ check_arch() {
         aarch64|arm64)
             info "架构兼容 (ARM64/aarch64)"
             ;;
-        mips|mipsel)
-            warn "检测到MIPS架构，本程序为aarch64版本，可能无法运行"
-            warn "请确认您的路由器型号是否为联发科版(MT7981B)"
-            ;;
         *)
-            warn "未知架构: $ARCH"
+            error "不支持的架构: $ARCH（本程序仅支持 aarch64/arm64）"
             ;;
     esac
 }
 
-# 检查文件
-check_files() {
+check_wget() {
+    if ! command -v wget >/dev/null 2>&1; then
+        error "未找到 wget 命令，请先安装 wget"
+    fi
+}
+
+# ---------- 下载发布包 ----------
+download_package() {
+    info "下载 memfix ${VERSION} 发布包..."
+
+    # 构建下载URL（通过gh-proxy加速）
+    PKG_NAME="${PROG_NAME}-${VERSION}-aarch64.tar.gz"
+    DOWNLOAD_URL="${GH_PROXY}/https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${PKG_NAME}"
+
+    info "下载地址: $DOWNLOAD_URL"
+
+    mkdir -p "$TMP_DIR"
+    cd "$TMP_DIR"
+
+    # 下载（带重试）
+    if ! wget --tries=3 --timeout=30 -qO "$PKG_NAME" "$DOWNLOAD_URL"; then
+        # 尝试不带版本号的latest格式
+        PKG_NAME_LATEST="${PROG_NAME}-aarch64.tar.gz"
+        LATEST_URL="${GH_PROXY}/https://github.com/${GITHUB_REPO}/releases/latest/download/${PKG_NAME_LATEST}"
+        info "首次下载失败，尝试 latest 地址: $LATEST_URL"
+        if ! wget --tries=3 --timeout=30 -qO "$PKG_NAME" "$LATEST_URL"; then
+            rm -rf "$TMP_DIR"
+            error "下载失败！请检查网络或版本号是否正确。"
+            error "可手动指定版本: MEMFIX_VERSION=v1.1.0 wget -qO- <脚本URL> | sh"
+        fi
+    fi
+
+    # 验证文件
+    if [ ! -s "$PKG_NAME" ]; then
+        rm -rf "$TMP_DIR"
+        error "下载的文件为空"
+    fi
+
+    PKG_SIZE=$(ls -l "$PKG_NAME" | awk '{print $5}')
+    info "下载完成，大小: ${PKG_SIZE} 字节"
+}
+
+# ---------- 解压 ----------
+extract_package() {
+    info "解压发布包..."
+    cd "$TMP_DIR"
+    tar xzf "$PKG_NAME"
+
+    # 检查关键文件
     if [ ! -f "./memfix" ]; then
-        error "未找到 memfix 可执行文件"
-    fi
-    if [ ! -x "./memfix" ]; then
-        chmod +x ./memfix
-    fi
-}
-
-# 创建安装目录
-create_dirs() {
-    info "创建安装目录..."
-    mkdir -p "$INSTALL_BIN"
-    mkdir -p "/etc/init.d"
-}
-
-# 安装主程序
-install_bin() {
-    info "安装主程序到 $INSTALL_BIN ..."
-    cp "./memfix" "$INSTALL_BIN/memfix"
-    chmod 755 "$INSTALL_BIN/memfix"
-
-    # 创建符号链接到PATH中（如果/usr/sbin可写）
-    if [ -w "/usr/sbin" ]; then
-        ln -sf "$INSTALL_BIN/memfix" "/usr/sbin/memfix"
-        info "已创建符号链接: /usr/sbin/memfix -> $INSTALL_BIN/memfix"
-    else
-        # /usr/sbin只读，添加到profile的PATH
-        if ! grep -q "$INSTALL_BIN" "/etc/profile" 2>/dev/null; then
-            echo "export PATH=\$PATH:$INSTALL_BIN" >> "/etc/profile"
-            info "已将 $INSTALL_BIN 添加到 /etc/profile 的PATH中"
-            info "请重新登录SSH或执行 'source /etc/profile' 使PATH生效"
+        # 可能在子目录中
+        if [ -d "./${PROG_NAME}-${VERSION}" ]; then
+            cd "./${PROG_NAME}-${VERSION}"
+        elif [ -d "./memfix" ]; then
+            cd "./memfix"
         fi
     fi
-}
 
-# 安装配置文件
-install_config() {
-    info "安装配置文件..."
-    CONFIG_SRC="./memfix.conf"
-    if [ -f "./memfix.xiaomi.conf" ]; then
-        CONFIG_SRC="./memfix.xiaomi.conf"
-        info "使用小米固件专用配置"
+    if [ ! -f "./memfix" ]; then
+        error "解压后未找到 memfix 二进制文件"
     fi
 
-    if [ -f "$INSTALL_ETC/memfix.conf" ]; then
-        warn "配置文件已存在，保留原配置"
-        cp "$CONFIG_SRC" "$INSTALL_ETC/memfix.conf.new"
-        info "新配置已保存为 $INSTALL_ETC/memfix.conf.new"
-    else
-        cp "$CONFIG_SRC" "$INSTALL_ETC/memfix.conf"
-        chmod 644 "$INSTALL_ETC/memfix.conf"
-        info "已安装配置文件: $INSTALL_ETC/memfix.conf"
-    fi
+    info "解压完成"
 }
 
-# 安装init.d启动脚本
-install_init() {
-    info "安装启动脚本..."
-    if [ -f "./S99memfix" ]; then
-        # 修改脚本中的程序路径为实际安装路径
-        sed "s|/usr/sbin/memfix|$INSTALL_BIN/memfix|g" "./S99memfix" > "$INIT_SCRIPT"
-        chmod 755 "$INIT_SCRIPT"
-        info "已安装启动脚本: $INIT_SCRIPT"
+# ---------- 安装 ----------
+install_files() {
+    info "安装到 $INSTALL_DIR ..."
+    mkdir -p "$INSTALL_DIR"
 
-        # 尝试启用（OpenWrt方式）
-        if [ -x "/etc/rc.common" ]; then
-            "$INIT_SCRIPT" enable 2>/dev/null || warn "无法通过init.d启用，将使用rc.local方式"
+    # 备份旧版本
+    if [ -f "$INSTALL_DIR/memfix" ]; then
+        cp "$INSTALL_DIR/memfix" "$INSTALL_DIR/memfix.old.bak" 2>/dev/null || true
+        info "已备份旧版本为 memfix.old.bak"
+    fi
+    if [ -f "$INSTALL_DIR/memfix.conf" ]; then
+        cp "$INSTALL_DIR/memfix.conf" "$INSTALL_DIR/memfix.conf.bak" 2>/dev/null || true
+    fi
+
+    # 安装二进制
+    cp "./memfix" "$INSTALL_DIR/memfix"
+    chmod 755 "$INSTALL_DIR/memfix"
+
+    # 安装配置文件（保留用户已有配置）
+    if [ -f "$INSTALL_DIR/memfix.conf" ]; then
+        info "保留已有配置文件"
+        # 检查是否有log_file配置项，没有则追加
+        if ! grep -q "log_file" "$INSTALL_DIR/memfix.conf" 2>/dev/null; then
+            echo "" >> "$INSTALL_DIR/memfix.conf"
+            echo "# 日志文件路径（v1.1.0新增）" >> "$INSTALL_DIR/memfix.conf"
+            echo "log_file = $INSTALL_DIR/memfix.log" >> "$INSTALL_DIR/memfix.conf"
+            info "已追加 log_file 配置项"
         fi
     else
-        warn "未找到S99memfix启动脚本，将使用rc.local方式"
-    fi
-}
-
-# 配置rc.local开机自启（兼容小米固件）
-install_rclocal() {
-    info "配置开机自启..."
-
-    # 确保rc.local存在且可执行
-    if [ ! -f "$RC_LOCAL" ]; then
-        echo "#!/bin/sh" > "$RC_LOCAL"
-        echo "" >> "$RC_LOCAL"
-        echo "exit 0" >> "$RC_LOCAL"
-    fi
-    chmod +x "$RC_LOCAL"
-
-    # 检查是否已添加
-    if grep -q "memfix" "$RC_LOCAL" 2>/dev/null; then
-        info "rc.local已配置memfix开机自启"
-    else
-        # 在exit 0之前插入启动命令
-        if grep -q "exit 0" "$RC_LOCAL"; then
-            sed -i '/exit 0/i\# memfix 内存泄漏监控修复\n'"$INSTALL_BIN"'/memfix start\n' "$RC_LOCAL"
-        else
-            echo "" >> "$RC_LOCAL"
-            echo "# memfix 内存泄漏监控修复" >> "$RC_LOCAL"
-            echo "$INSTALL_BIN/memfix start" >> "$RC_LOCAL"
-            echo "" >> "$RC_LOCAL"
-            echo "exit 0" >> "$RC_LOCAL"
+        if [ -f "./memfix.xiaomi.conf" ]; then
+            cp "./memfix.xiaomi.conf" "$INSTALL_DIR/memfix.conf"
+            info "已安装小米专用配置文件"
+        elif [ -f "./memfix.conf" ]; then
+            cp "./memfix.conf" "$INSTALL_DIR/memfix.conf"
+            info "已安装配置文件"
         fi
-        info "已添加到 $RC_LOCAL 开机自启"
+        chmod 644 "$INSTALL_DIR/memfix.conf"
     fi
+
+    # 安装memfixctl管理脚本
+    if [ -f "./memfixctl" ]; then
+        cp "./memfixctl" "$INSTALL_DIR/memfixctl"
+        chmod 755 "$INSTALL_DIR/memfixctl"
+        info "已安装 memfixctl 管理脚本"
+    fi
+
+    # 复制配置到/etc（程序默认读取/etc/memfix.conf）
+    cp "$INSTALL_DIR/memfix.conf" "$CONF_DST" 2>/dev/null || true
+
+    info "文件安装完成"
 }
 
-# 启动服务
+# ---------- 配置开机自启（crontab方式） ----------
+install_autostart() {
+    info "配置开机自启（crontab每分钟检查拉起）..."
+
+    # 确保crontab目录存在
+    mkdir -p /etc/crontabs
+
+    # 检查是否已配置
+    if grep -q "memfixctl" "$CRON_FILE" 2>/dev/null; then
+        info "crontab已配置memfix自启，跳过"
+    else
+        echo "* * * * * $INSTALL_DIR/memfixctl start >/dev/null 2>&1" >> "$CRON_FILE"
+        info "已添加到 crontab"
+    fi
+
+    # 重载crontab
+    if command -v crontab >/dev/null 2>&1; then
+        crontab "$CRON_FILE" 2>/dev/null || true
+    fi
+
+    # 确保cron服务运行
+    if [ -x "/etc/init.d/cron" ]; then
+        /etc/init.d/cron start 2>/dev/null || true
+    fi
+
+    info "自启配置完成"
+}
+
+# ---------- 启动服务 ----------
 start_service() {
     info "启动 memfix 服务..."
-    "$INSTALL_BIN/memfix" start
+
+    # 先停止旧进程
+    if [ -x "$INSTALL_DIR/memfixctl" ]; then
+        "$INSTALL_DIR/memfixctl" stop 2>/dev/null || true
+    else
+        kill "$(ps w | grep "$INSTALL_DIR/memfix " | grep -v grep | awk '{print $1}')" 2>/dev/null || true
+    fi
+    sleep 1
+
+    # 清理旧PID
+    rm -f /var/run/memfix.pid /tmp/memfix.pid 2>/dev/null || true
+
+    # 启动
+    if [ -x "$INSTALL_DIR/memfixctl" ]; then
+        "$INSTALL_DIR/memfixctl" start
+    else
+        "$INSTALL_DIR/memfix" start
+    fi
     sleep 2
 
-    # 验证
-    if "$INSTALL_BIN/memfix" status >/dev/null 2>&1; then
-        info "memfix 服务启动成功"
+    # 验证进程
+    if ps w | grep -q "$INSTALL_DIR/memfix " | grep -v grep >/dev/null 2>&1; then
+        PID=$(ps w | grep "$INSTALL_DIR/memfix " | grep -v grep | head -1 | awk '{print $1}')
+        info "memfix 启动成功，PID=$PID"
     else
-        warn "服务状态检查失败，请手动执行: $INSTALL_BIN/memfix status"
+        warn "进程检查异常，请手动执行: $INSTALL_DIR/memfixctl status"
     fi
 }
 
-# 显示安装信息
+# ---------- 验证安装 ----------
+verify_install() {
+    echo ""
+    info "========== 安装验证 =========="
+
+    # 检查文件
+    ls -la "$INSTALL_DIR/memfix" "$INSTALL_DIR/memfix.conf" 2>/dev/null
+
+    # 检查版本
+    echo ""
+    info "程序版本:"
+    "$INSTALL_DIR/memfix" --version 2>/dev/null || "$INSTALL_DIR/memfix" -v 2>/dev/null || echo "(版本信息见日志)"
+
+    # 检查状态
+    echo ""
+    info "运行状态:"
+    if [ -x "$INSTALL_DIR/memfixctl" ]; then
+        "$INSTALL_DIR/memfixctl" status 2>&1 | head -20
+    else
+        "$INSTALL_DIR/memfix" status 2>&1 | head -20
+    fi
+
+    # 检查日志
+    LOG_FILE=$(grep "log_file" "$INSTALL_DIR/memfix.conf" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')
+    if [ -z "$LOG_FILE" ]; then
+        LOG_FILE="/tmp/memfix.log"
+    fi
+    echo ""
+    info "日志文件: $LOG_FILE"
+    if [ -f "$LOG_FILE" ]; then
+        tail -5 "$LOG_FILE"
+    else
+        warn "日志文件尚未生成"
+    fi
+}
+
+# ---------- 清理 ----------
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+
+# ---------- 显示安装摘要 ----------
 show_summary() {
     echo ""
     echo "============================================"
-    echo "  memfix v${VERSION} 小米固件安装完成！"
+    echo "  memfix ${VERSION} 安装完成！"
     echo "============================================"
     echo ""
-    echo "安装路径:"
-    echo "  主程序:   $INSTALL_BIN/memfix"
-    echo "  配置文件: $INSTALL_ETC/memfix.conf"
-    echo "  启动脚本: $INIT_SCRIPT"
-    echo "  开机自启: $RC_LOCAL"
-    echo ""
-    echo "注意事项:"
-    echo "  1. 小米固件/var为tmpfs，重启后PID文件和日志会丢失"
-    echo "     但程序仍在后台运行，不影响功能"
-    echo "  2. 重启后程序通过rc.local自动启动"
-    echo "  3. 如需持久化日志，可修改配置或源码"
+    echo "安装路径:   $INSTALL_DIR"
+    echo "主程序:     $INSTALL_DIR/memfix"
+    echo "配置文件:   $INSTALL_DIR/memfix.conf"
+    echo "管理脚本:   $INSTALL_DIR/memfixctl"
+    echo "日志文件:   $LOG_FILE"
+    echo "开机自启:   crontab (每分钟检查拉起)"
     echo ""
     echo "常用命令:"
-    echo "  memfix start      # 启动"
-    echo "  memfix stop       # 停止"
-    echo "  memfix restart    # 重启"
-    echo "  memfix status     # 状态"
-    echo "  memfix once       # 单次回收"
+    echo "  $INSTALL_DIR/memfixctl start    # 启动"
+    echo "  $INSTALL_DIR/memfixctl stop     # 停止"
+    echo "  $INSTALL_DIR/memfixctl restart  # 重启"
+    echo "  $INSTALL_DIR/memfixctl status   # 查看状态"
+    echo "  $INSTALL_DIR/memfixctl once     # 单次强制回收"
     echo ""
-    echo "如果提示'memfix: not found'，请执行:"
-    echo "  export PATH=\$PATH:$INSTALL_BIN"
-    echo "  或重新登录SSH"
-    echo ""
-    echo "配置修改:"
-    echo "  vi $INSTALL_ETC/memfix.conf"
-    echo "  memfix restart"
+    echo "配置修改后执行: $INSTALL_DIR/memfixctl restart"
     echo "============================================"
 }
 
-# 主流程
+# ---------- 主流程 ----------
 main() {
-    echo "memfix v${VERSION} 小米固件安装脚本"
-    echo "===================================="
+    echo "============================================"
+    echo "  memfix ${VERSION} 一键安装脚本"
+    echo "  小米AX3000T (联发科MT7981B) 专用"
+    echo "  下载加速: gh-proxy.com"
+    echo "============================================"
     echo ""
 
     check_root
-    detect_xiaomi || true
     check_arch
-    check_files
-    create_dirs
-    install_bin
-    install_config
-    install_init
-    install_rclocal
+    check_wget
+    download_package
+    extract_package
+    install_files
+    install_autostart
     start_service
+    verify_install
+    cleanup
     show_summary
+
+    info "安装全部完成！"
 }
 
 main "$@"
