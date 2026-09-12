@@ -48,120 +48,6 @@ jobs:
           path: build/memfix-aarch64
 
   # ============================================
-  # C版本: aarch64 gnu 静态编译 (稳定，apt源)
-  # ============================================
-  build-c-aarch64-gnu:
-    name: C Cross Build (aarch64 gnu)
-    runs-on: ubuntu-latest
-    continue-on-error: true  # C版本编译失败不阻塞主流程
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Build (aarch64 gnu static)
-        run: make cross-gnu
-
-      - name: Verify binary
-        run: |
-          file build/memfix-aarch64 2>/dev/null || true
-          ls -lh build/memfix-aarch64 2>/dev/null || true
-          ldd build/memfix-aarch64 2>&1 || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PROJECT_NAME }}-c-aarch64-gnu
-          path: build/memfix-aarch64
-        continue-on-error: true
-
-  # ============================================
-  # C版本: aarch64 musl 静态编译 (可选，尽力而为)
-  # musl.cc下载不稳定，下载失败则跳过（gnu版本由独立job提供）
-  # ============================================
-  build-c-aarch64-musl:
-    name: C Cross Build (aarch64 musl static)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Cache musl toolchain
-        id: cache-toolchain
-        uses: actions/cache@v4
-        with:
-          path: aarch64-linux-musl-cross
-          key: ${{ runner.os }}-musl-aarch64-v1
-
-      - name: Download musl toolchain (with retry + mirrors)
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        run: |
-          # 尝试多个镜像源，curl带重试；全部失败则跳过（不报错）
-          # 注意: GitHub Actions run步骤默认启用 set -e，下载失败会直接终止脚本，
-          # 所以下载部分必须用 set +e 包裹，最后再恢复
-          set +e
-          download_musl() {
-            local url="$1"
-            echo "尝试下载: $url"
-            curl -fL --retry 2 --retry-delay 3 --connect-timeout 15 --max-time 90 \
-              -o aarch64-linux-musl-cross.tgz "$url" && return 0
-            return 1
-          }
-
-          # 镜像列表（按优先级），失败则继续尝试下一个
-          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz"
-          if [ $? -ne 0 ]; then
-            download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz"
-          fi
-          set -e
-
-          # 检查下载结果：文件不存在 或 tar包损坏 都视为失败，跳过（不导致job失败）
-          if [ ! -s aarch64-linux-musl-cross.tgz ]; then
-            echo "::notice::musl工具链下载失败（无文件），跳过musl构建（gnu版本由独立job提供）"
-            exit 0
-          fi
-          if ! tar tzf aarch64-linux-musl-cross.tgz >/dev/null 2>&1; then
-            echo "::warning::musl工具链下载不完整或损坏，跳过musl构建（gnu版本由独立job提供）"
-            rm -f aarch64-linux-musl-cross.tgz
-            exit 0
-          fi
-          tar xzf aarch64-linux-musl-cross.tgz
-          ls -la aarch64-linux-musl-cross/bin/
-
-      - name: Build with musl (if available)
-        run: |
-          if [ -x aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc ]; then
-            export PATH=$PATH:$(pwd)/aarch64-linux-musl-cross/bin
-            make cross-musl
-          else
-            echo "musl工具链不可用，跳过musl构建"
-            exit 0
-          fi
-
-      - name: Verify binary
-        run: |
-          if [ -f build/memfix-aarch64 ]; then
-            file build/memfix-aarch64
-            ls -lh build/memfix-aarch64
-            ldd build/memfix-aarch64 2>&1 || true
-          else
-            echo "未生成musl二进制（已跳过，gnu版本见独立job）"
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PROJECT_NAME }}-c-aarch64-musl
-          path: build/memfix-aarch64
-        continue-on-error: true
-
-  # ============================================
   # 发布 (依赖Go版本的aarch64构建)
   # ============================================
   release:
@@ -197,9 +83,8 @@ jobs:
           cp ../README.md .
           cp ../CHANGELOG.md .
           cp ../LICENSE .
-          # 复制源码
-          mkdir -p src go/src/memfix
-          cp ../src/*.c ../src/*.h src/ 2>/dev/null || true
+          # 复制源码（仅Go版本）
+          mkdir -p go/src/memfix
           cp ../go/src/memfix/*.go ../go/src/memfix/go.mod go/src/memfix/ 2>/dev/null || true
           # 显示内容
           ls -la
