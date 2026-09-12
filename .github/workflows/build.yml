@@ -103,6 +103,9 @@ jobs:
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           # 尝试多个镜像源，curl带重试；全部失败则跳过（不报错）
+          # 注意: GitHub Actions run步骤默认启用 set -e，下载失败会直接终止脚本，
+          # 所以下载部分必须用 set +e 包裹，最后再恢复
+          set +e
           download_musl() {
             local url="$1"
             echo "尝试下载: $url"
@@ -111,13 +114,21 @@ jobs:
             return 1
           }
 
-          # 镜像列表（按优先级）
-          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz" || \
-          download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz"
+          # 镜像列表（按优先级），失败则继续尝试下一个
+          download_musl "https://musl.cc/aarch64-linux-musl-cross.tgz"
+          if [ $? -ne 0 ]; then
+            download_musl "https://more.musl.cc/x86_64-linux-musl/aarch64-linux-musl-cross.tgz"
+          fi
+          set -e
 
-          # 检查下载结果，失败则跳过（不导致job失败）
+          # 检查下载结果：文件不存在 或 tar包损坏 都视为失败，跳过（不导致job失败）
           if [ ! -s aarch64-linux-musl-cross.tgz ]; then
-            echo "::notice::musl工具链下载失败，跳过musl构建（gnu版本由独立job提供）"
+            echo "::notice::musl工具链下载失败（无文件），跳过musl构建（gnu版本由独立job提供）"
+            exit 0
+          fi
+          if ! tar tzf aarch64-linux-musl-cross.tgz >/dev/null 2>&1; then
+            echo "::warning::musl工具链下载不完整或损坏，跳过musl构建（gnu版本由独立job提供）"
+            rm -f aarch64-linux-musl-cross.tgz
             exit 0
           fi
           tar xzf aarch64-linux-musl-cross.tgz
